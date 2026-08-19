@@ -50,8 +50,16 @@ EATEN = {
         "cat > \"$D/q.txt\" <<'EOF'\n\u201cquoted\u201d text\nEOF\n",
     "axis2: non-ASCII in a python heredoc string (PR body edit)":
         "python - \"$S\" <<'EOF'\ns = s.replace(\"Two changes\", \"Three changes \u2014 see above\")\nEOF\n",
+    "axis1: backslash pair in a double-quoted-delimiter heredoc (<<\"EOF\")":
+        "cat > \"$D/dq.txt\" <<\"EOF\"\nx\\\\y\nEOF\n",
+    "axis1: backslash pair in a dash heredoc (<<-'EOF')":
+        "cat > \"$D/dash.txt\" <<-'EOF'\n\tx\\\\y\n\tEOF\n",
     "unquoted heredoc with $ in the body (bash semantics, never meant)":
         "git commit -F - <<EOF\nrpath: $ORIGIN and $ORIGIN/../lib\nEOF\n",
+    "unquoted heredoc with $ piped into git commit":
+        "cat <<EOF | git commit -F -\ncost $5\nEOF\n",
+    "unquoted heredoc feeding git tag":
+        "git tag -a v1 -F - <<EOF\nrelease `date`\nEOF\n",
 }
 
 # --- corpus: shapes that came through byte-exact and must stay allowed -------------------
@@ -107,6 +115,20 @@ OK = {
         "python -c \"import json; d=json.load(open('x.json')); print(list(d))\"",
     "awk with an escaped tab in single quotes (lone backslash)":
         "gh pr checks 3781 -R o/r | awk -F'\\t' '{print $2}' | sort | uniq -c",
+    "an earlier gh command does not make a later heredoc a prose sink (&&)":
+        "gh pr list -R o/r > x && cat <<EOF > y\nhome $HOME\nEOF\n",
+    "an earlier git commit does not make a later python heredoc a prose sink":
+        "git commit -m done && python - <<EOF\nprint('$HOME')\nEOF\n",
+    "a sink word inside an unrelated quoted string":
+        "echo 'see gh run view' && cat <<EOF\nv $x\nEOF\n",
+    "an earlier gh command on the same line, semicolon-separated":
+        "gh pr view 1; cat <<EOF\nv $x\nEOF\n",
+    "an earlier git commit on a previous line":
+        "git commit -m x\ncat <<EOF\nv $x\nEOF\n",
+    "heredoc into a file that a later git commit reads":
+        "cat <<EOF > /tmp/m && git commit -F /tmp/m\nv $x\nEOF\n",
+    "python -c with a single-quoted Windows path inside double quotes (in_double tracking)":
+        "python -c \"print('D:\\\\MCP')\"",
 }
 
 # --- corpus: outputs of mangled runs (verbatim fragments) ---------------------------------
@@ -183,11 +205,24 @@ class PreRules(unittest.TestCase):
         docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
         self.assertEqual([(True, "a $b"), (False, "c")], docs)
 
+    def test_sink_segment_owns_only_the_heredoc_operator(self):
+        cmd = "gh pr view 1; cat <<EOF | git commit -F -\nv\nEOF\n"
+        a = next(iter(rules.heredocs(cmd)))[1]
+        self.assertEqual(" cat <<EOF | git commit -F -", rules.sink_segment(cmd, a))
+        cmd2 = "git commit -m x\ncat <<EOF\nv\nEOF\n"
+        a2 = next(iter(rules.heredocs(cmd2)))[1]
+        self.assertEqual("cat <<EOF", rules.sink_segment(cmd2, a2))
+
+    def test_double_quote_tracking_keeps_nested_single_quotes_processed(self):
+        runs = list(rules.backslash_runs("python -c \"print('D:\\\\MCP')\""))
+        self.assertEqual([(2, "processed", "M")], runs)
+
     def test_unquoted_heredoc_rule_is_for_prose_sinks_only(self):
         self.assertIsNone(rules.rule_unquoted_heredoc_expansion("git commit -F - <<EOF\nplain\nEOF\n"))
         self.assertIsNotNone(rules.rule_unquoted_heredoc_expansion("git commit -F - <<EOF\na `b`\nEOF\n"))
         self.assertIsNotNone(rules.rule_unquoted_heredoc_expansion("gh pr create --body-file - <<EOF\ncost $5\nEOF\n"))
         self.assertIsNone(rules.rule_unquoted_heredoc_expansion("cat <<EOF\na `b` $c\nEOF\n"), "expansion into cat/python may be intended")
+        self.assertIsNotNone(rules.rule_unquoted_heredoc_expansion("git tag -a v1 -F - <<EOF\nat `date`\nEOF\n"), "git tag is a prose sink")
 
 
 class PostSignatures(unittest.TestCase):
@@ -225,6 +260,12 @@ class PostSignatures(unittest.TestCase):
         t0 = time.perf_counter()
         self.assertIsNone(rules.post_check("x", text))
         self.assertLess(time.perf_counter() - t0, 0.5, "a 400 KB non-matching cascade must stay cheap")
+        anchored = ("some ordinary output line\n" * 20000) + "x: command not found\n" + "y\n" * 300 + "... export TEMP='C:' ..."
+        t0 = time.perf_counter()
+        self.assertIsNotNone(rules.post_check("x", anchored))
+        self.assertLess(time.perf_counter() - t0, 0.5, "the anchored window stays cheap too")
+        far = ("x: command not found\n") + ("y\n" * 3000) + "... export TEMP='C:' ..."
+        self.assertIsNone(rules.post_check("x", far), "a cascade line outside the 4000-char window before the anchor is not the fingerprint")
 
     def test_backslash_command_flags_even_with_quiet_output(self):
         msg = rules.post_check("printf '%s' 'lit:D:\\\\MCP\\\\x'", "")
@@ -306,6 +347,23 @@ class PostHook(unittest.TestCase):
         r2 = run_hook("bash_post.py", {"tool_name": "Bash", "tool_input": {"command": "x"}, "tool_response": "fine"})
         self.assertEqual(0, r2.returncode)
         self.assertEqual("", r2.stdout.strip())
+
+    def test_decide_flags_a_quiet_run_from_the_command_alone(self):
+        ev = {"tool_name": "Bash", "tool_input": {"command": "printf '%s' 'lit:D:\\\\MCP\\\\x'"}, "tool_response": {"stdout": "", "stderr": ""}}
+        out = bash_post.decide(ev)
+        self.assertIsNotNone(out, "a silent backslash-collapse run must be flagged from the command")
+        self.assertIn("backslash run", out["additionalContext"])
+
+    def test_fails_open_when_the_rules_module_is_missing(self):
+        r = subprocess.run([sys.executable, "-c",
+                            "import sys, json, io; sys.argv=['x'];"
+                            "import importlib.util; spec=importlib.util.spec_from_file_location('bp', %r);"
+                            "m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m);"
+                            "sys.stdin=io.StringIO(json.dumps({'tool_name':'Bash','tool_input':{'command':'x'},'tool_response':'y'}));"
+                            "m.os.path.dirname=lambda p: 'nope'; sys.exit(m.main())" % os.path.join(HOOKS, "bash_post.py")],
+                           capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=""))
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertIn("hook error", r.stderr)
 
     def test_fails_open_on_garbage_stdin(self):
         r = subprocess.run([sys.executable, os.path.join(HOOKS, "bash_post.py")], input="{not json",

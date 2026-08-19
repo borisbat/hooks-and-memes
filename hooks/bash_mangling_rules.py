@@ -12,6 +12,7 @@ Backticks, $(...), ${...} and quoted heredocs behave exactly as bash defines the
 Every rule's message has to stand on its own: it is what the model reads instead of the
 tool running, so it names the fix, not the theory.
 """
+import functools
 import re
 
 FIX_FILE = ("write the text/script to a file with the Write tool and pass the PATH "
@@ -24,10 +25,11 @@ _HEREDOC = re.compile(r"<<-?\s*(?P<q>['\"]?)(?P<tag>\w+)(?P=q)[^\n]*\n(?P<body>.
 _DQ_SPECIAL = set('"$`\\\n')
 
 
+@functools.lru_cache(maxsize=64)
 def heredocs(command):
-    """Yield (quoted_delimiter: bool, body_start, body_end) for every heredoc in the command."""
-    for m in _HEREDOC.finditer(command):
-        yield bool(m.group("q")), m.start("body"), m.end("body")
+    """(quoted_delimiter: bool, body_start, body_end) for every heredoc in the command -
+    one regex pass per command however many rules ask."""
+    return tuple((bool(m.group("q")), m.start("body"), m.end("body")) for m in _HEREDOC.finditer(command))
 
 
 def backslash_runs(command):
@@ -36,13 +38,16 @@ def backslash_runs(command):
     context is "literal" where bash does no backslash processing (single quotes, a quoted
     heredoc body) and "processed" elsewhere (double quotes, bare words, unquoted heredocs).
     """
-    literal_spans = [(a, b) for quoted, a, b in heredocs(command) if quoted]
+    literal_spans = sorted((a, b) for quoted, a, b in heredocs(command) if quoted)
+    span_idx = 0
     n = len(command)
     i = 0
     in_single = in_double = False
     while i < n:
         c = command[i]
-        in_heredoc = any(a <= i < b for a, b in literal_spans)
+        while span_idx < len(literal_spans) and literal_spans[span_idx][1] <= i:
+            span_idx += 1
+        in_heredoc = span_idx < len(literal_spans) and literal_spans[span_idx][0] <= i
         if c == "\\":
             j = i
             while j < n and command[j] == "\\":
@@ -83,6 +88,25 @@ def rule_backslash_pair(command):
 
 
 _PROSE_SINK = re.compile(r"\b(git\s+commit|git\s+tag|gh\s+\w+)\b")
+_LIST_SEP = re.compile(r"&&|\|\||;")
+
+
+def sink_segment(command, body_start):
+    """The piece of the heredoc's opener line that owns the `<<`: split on && || ; but not
+    on |, so `cat <<EOF | git commit -F -` keeps its sink while an earlier, unrelated
+    `git commit && cat <<EOF` does not leak into this heredoc."""
+    head = command[:body_start].rstrip("\n")
+    line = head[head.rfind("\n") + 1:]
+    op = line.rfind("<<")
+    if op < 0:
+        return line
+    lo = 0
+    for m in _LIST_SEP.finditer(line):
+        if m.end() <= op:
+            lo = m.end()
+        else:
+            return line[lo:m.start()]
+    return line[lo:]
 
 
 def rule_unquoted_heredoc_expansion(command):
@@ -91,8 +115,7 @@ def rule_unquoted_heredoc_expansion(command):
     it, so only prose sinks (git commit/tag, gh) are denied."""
     for quoted, a, b in heredocs(command):
         body = command[a:b]
-        head = command[:a]
-        if not quoted and ("$" in body or "`" in body) and _PROSE_SINK.search(head):
+        if not quoted and ("$" in body or "`" in body) and _PROSE_SINK.search(sink_segment(command, a)):
             return ("heredoc delimiter is unquoted, so $... and `...` inside the message expand "
                     "before the program sees it; quote it (<<'EOF') or " + FIX_FILE)
     return None
