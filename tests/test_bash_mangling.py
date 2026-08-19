@@ -98,6 +98,16 @@ EATEN = {
         "echo \"$(case x in x) printf '%s' 'x\\\\y';; esac)\" > /tmp/h5.txt",
     "multi-heredoc sink: a semicolon inside a quoted title is not a separator":
         "gh pr create --title \"fix; details\" --body-file - <<EOF\ncost $5\nEOF\n",
+    "codex: a joined continuation line is body, the heredoc runs to the real terminator":
+        "git commit -F - <<EOF\nprefix\\\nEOF\ncost $5\nEOF\n",
+    "codex: arithmetic shift is not a heredoc opener (the pair after is literal)":
+        "echo $((1 << 2))\nprintf '%s' 'x\\\\y' > /tmp/a1.txt",
+    "codex: bare word case in a substitution must not arm case parsing":
+        "echo \"$(echo case)\"; printf '%s' 'x\\\\y' > /tmp/a2.txt",
+    "codex: heredoc delimiter split by a line continuation (<<EO backslash newline F)":
+        "cat <<EO\\\nF\nbody\nEOF\nprintf '%s' 'x\\\\y' > /tmp/a3.txt\nEO\n",
+    "codex: backslash runs inside a delimiter word still count":
+        "cat <<A\\\\\\\\\\\\B\nbody\nA\\\\\\B\n",
     "unquoted heredoc with $ in the body (bash semantics, never meant)":
         "git commit -F - <<EOF\nrpath: $ORIGIN and $ORIGIN/../lib\nEOF\n",
     "unquoted heredoc with $ piped into git commit":
@@ -243,6 +253,34 @@ class PreRules(unittest.TestCase):
         self.assertIsNotNone(rules.rule_backslash_pair('printf "%s" "x\\\\$y"'), "pair before a double-quote-special char")
         self.assertIsNotNone(rules.rule_backslash_pair("printf '%s' 'x\\\\y'"), "any pair in single quotes is a byte change")
         self.assertIsNone(rules.rule_backslash_pair("printf '%s' 'x\\y'"), "lone backslashes survive")
+
+    def test_failed_joined_terminator_consumes_the_whole_joined_extent(self):
+        cmd = "cat <<EOF\nprefix\\\nEOF\ncost $5\nEOF\n"
+        docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
+        self.assertEqual([(False, "prefix\\\nEOF\ncost $5")], docs,
+                         "prefixEOF is not the terminator, so both physical lines and the $5 line are body")
+
+    def test_arithmetic_shift_opens_no_heredoc(self):
+        self.assertEqual((), tuple(rules.heredocs("echo $((1 << 2))\nx\n2\n")))
+        self.assertEqual((), tuple(rules.heredocs("((1 << 2))\nx\n2\n")))
+
+    def test_case_word_counts_only_in_command_position(self):
+        runs = list(rules.backslash_runs("echo \"$(echo case)\"; printf '%s' 'x\\\\y'"))
+        self.assertEqual([(2, "literal", "y")], runs)
+
+    def test_subshell_inside_case_action_keeps_paren_balance(self):
+        runs = list(rules.backslash_runs("echo \"$(case x in x) (echo hi);; esac)b\\\\c\""))
+        self.assertEqual([(2, "processed", "c")], runs, "the final ) closes the frame; back inside double quotes")
+
+    def test_delimiter_continuation_joins_before_tokenizing(self):
+        cmd = "cat <<EO\\\nF\nbody\nEOF\n"
+        docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
+        self.assertEqual([(False, "body")], docs, "the delimiter is EOF, not EO")
+
+    def test_delimiter_word_backslash_runs_are_yielded(self):
+        cmd = "cat <<A\\\\\\\\\\\\B\nbody\nA\\\\\\B\n"
+        self.assertTrue(any(r[0] == 6 for r in rules.backslash_runs(cmd)),
+                        "six backslashes in the delimiter word collapse to three - the run must be visible")
 
     def test_heredoc_inside_substitution_is_real_and_inside_single_quotes_is_not(self):
         real = "printf '%s' \"$(cat <<'EOF'\nbody\nEOF\n)\""

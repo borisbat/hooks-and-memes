@@ -85,7 +85,9 @@ def _lex(command):
     records = []
     i = 0
     in_single = in_double = in_comment = False
-    frames = []   # [saved_single, saved_double, paren_depth, case_depth] per open $(
+    cmd_pos = True   # at a command position (start / after ; & | ( && || newline)
+    arith = 0        # unmatched parens inside a $(( )) / (( )) region - no heredocs there
+    frames = []      # [saved_s, saved_d, paren_depth, case_depth, awaiting_in, pattern_wait]
     pending = []  # opener queue: [tag, dash, quoted, opener_pos]
     body = None   # active heredoc: [tag, dash, quoted, opener_pos, body_start, base_frames]
     # base_frames = frame depth when the body began: an ENCLOSING $( (the heredoc lives
@@ -94,6 +96,19 @@ def _lex(command):
 
     def start_next_body(pos):
         return [*pending.pop(0), pos, len(frames)] if pending else None
+
+    def emit_word_runs(word_text, tail):
+        k = 0
+        while k < len(word_text):
+            if word_text[k] == "\\":
+                j = k
+                while j < len(word_text) and word_text[j] == "\\":
+                    j += 1
+                nxt = word_text[j] if j < len(word_text) else (tail or "")
+                runs.append((j - k, "processed", nxt))
+                k = j
+            else:
+                k += 1
 
     while i < n:
         # ---- heredoc body mode (suspended while a substitution frame is open) ----------
@@ -121,6 +136,7 @@ def _lex(command):
                     i = term_end + 1  # the terminator line is inert - never scanned
                     body = start_next_body(i)
                     continue
+                eol = term_end  # a joined line that is NOT the terminator is body wholesale
             k = i
             while k < eol:
                 ch = command[k]
@@ -136,7 +152,7 @@ def _lex(command):
                 else:
                     k += 1
             if k < eol:  # broke on $(
-                frames.append([in_single, in_double, 0, 0])
+                frames.append([in_single, in_double, 0, 0, False, False])
                 in_single = in_double = False
                 i = k + 2
                 continue
@@ -145,6 +161,13 @@ def _lex(command):
 
         # ---- normal shell scanning ------------------------------------------------------
         c = command[i]
+        if arith:
+            if c == "(":
+                arith += 1
+            elif c == ")":
+                arith -= 1
+            i += 1
+            continue
         if in_comment:
             if c == "\n":
                 in_comment = False
@@ -171,37 +194,79 @@ def _lex(command):
             in_double = not in_double
         elif c == "#" and not in_single and not in_double and (i == 0 or command[i - 1] in " \t\n;&|("):
             in_comment = True
+        elif c == "$" and not in_single and command[i + 1:i + 3] == "((":
+            arith = 2  # $(( )) is arithmetic: << is a shift, quotes and heredocs do not apply
+            i += 3
+            continue
         elif c == "$" and not in_single and command[i + 1:i + 2] == "(":
-            frames.append([in_single, in_double, 0, 0])
+            frames.append([in_single, in_double, 0, 0, False, False])
             in_single = in_double = False
+            cmd_pos = True
+            i += 2
+            continue
+        elif c == "(" and not in_single and not in_double and cmd_pos and command[i + 1:i + 2] == "(":
+            arith = 2  # (( )) arithmetic command
             i += 2
             continue
         elif c == "(" and not in_single and not in_double and frames:
-            frames[-1][2] += 1
+            if frames[-1][5]:
+                pass  # the optional open paren of a case pattern
+            else:
+                frames[-1][2] += 1
+                cmd_pos = True
         elif c == ")" and not in_single and not in_double and frames:
             f = frames[-1]
-            if f[3] > 0:
-                pass  # a case-pattern paren, not structure
+            if f[5]:
+                f[5] = False  # a pattern closer: `x)` starts the action
+                cmd_pos = True
             elif f[2] > 0:
                 f[2] -= 1
             else:
-                in_single, in_double, _d, _c = frames.pop()
-        elif c == "c" and frames and not in_single and not in_double and _match_word(command, i, "case"):
+                in_single, in_double, _d, _c, _a, _p = frames.pop()
+        elif (c == ";" and command[i + 1:i + 2] == ";" and frames and frames[-1][3] > 0
+              and not in_single and not in_double):
+            frames[-1][5] = True  # `;;` - the next pattern follows
+            cmd_pos = True
+            i += 2
+            continue
+        elif (c == "c" and frames and not in_single and not in_double and cmd_pos
+              and _match_word(command, i, "case")):
             frames[-1][3] += 1
-        elif c == "e" and frames and not in_single and not in_double and _match_word(command, i, "esac"):
+            frames[-1][4] = True   # awaiting the `in` that opens the pattern list
+        elif (c == "i" and frames and frames[-1][4] and not in_single and not in_double
+              and _match_word(command, i, "in")):
+            frames[-1][4] = False
+            frames[-1][5] = True   # the first pattern follows
+        elif (c == "e" and frames and not in_single and not in_double and cmd_pos
+              and _match_word(command, i, "esac")):
             frames[-1][3] = max(0, frames[-1][3] - 1)
+            frames[-1][4] = frames[-1][5] = False
         elif (c == "<" and not in_single and not in_double and command[i:i + 2] == "<<"
               and command[i + 2:i + 3] != "<" and command[i - 1:i] != "<"):
             m = re.compile(r"<<(-?)[ \t]*").match(command, i)
             word = _DELIM_WORD.match(command, m.end())
             if word:
-                tag, quoted = _parse_delim(word.group())
+                raw = word.group()
+                end = word.end()
+                while command[end:end + 2] == "\\\n":  # bash removes backslash-newline before tokenizing
+                    more = _DELIM_WORD.match(command, end + 2)
+                    if not more:
+                        break
+                    raw += more.group()
+                    end = more.end()
+                tag, quoted = _parse_delim(raw)
+                emit_word_runs(raw, command[end:end + 1])
                 pending.append([tag, m.group(1) == "-", quoted, i])
-                i = word.end()
+                cmd_pos = False
+                i = end
                 continue
         elif c == "\n":
             if body is None and pending:
                 body = start_next_body(i + 1)
+        if c in ";&|\n":
+            cmd_pos = True
+        elif c not in " \t":
+            cmd_pos = False
         i += 1
     # an opener whose terminator never comes is not a heredoc (its runs already stand)
     return tuple(runs), tuple(records)
