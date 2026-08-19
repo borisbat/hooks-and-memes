@@ -10,6 +10,11 @@ Two mangling axes, each byte-proven against a file-run control (see tests/ corpu
      `pwd -P >|...-cwd` dump, before bash runs anything
 Backticks, $(...), ${...} and quoted heredocs behave exactly as bash defines them.
 
+The heart is one forward lexer (_lex) that carries what bash carries - quote state,
+comments, $( ) frames (with subshell parens and case patterns), and the heredoc queue -
+because every split-scanner design leaked: line-local opener scans missed heredocs inside
+substitutions and invented them inside multiline strings.
+
 Every rule's message has to stand on its own: it is what the model reads instead of the
 tool running, so it names the fix, not the theory.
 """
@@ -19,13 +24,13 @@ import re
 FIX_FILE = ("write the text/script to a file with the Write tool and pass the PATH "
             "(python script.py, --body-file FILE, -F body=@FILE, git commit -F FILE)")
 
-# --- heredoc parsing ---------------------------------------------------------------------
+# --- the lexer ---------------------------------------------------------------------------
 
 _DQ_SPECIAL = set('"$`\\\n')
 
-# a heredoc delimiter WORD: any mix of quoted segments, escaped chars and bare chars -
-# bash applies quote removal to get the tag, and ANY quoting anywhere makes it literal
-_DELIM_WORD = re.compile(r"(?:'[^'\n]*'|\"[^\"\n]*\"|\\[^\s]|[^\s'\"\\;&|<>()])+")
+# a heredoc delimiter WORD: quoted segments, escaped chars (escaped space included) and
+# bare chars - bash applies quote removal, and ANY quoting anywhere makes the body literal
+_DELIM_WORD = re.compile(r"(?:'[^'\n]*'|\"[^\"\n]*\"|\\.|[^\s'\"\\;&|<>()])+")
 
 
 def _parse_delim(word):
@@ -50,144 +55,114 @@ def _parse_delim(word):
     return "".join(tag), quoted
 
 
-def _scan_openers(line):
-    """(pos_in_line, dash, tag, quoted) for each heredoc opener on one code line.
+def _ends_with_odd_backslash(text):
+    k = len(text)
+    while k > 0 and text[k - 1] == "\\":
+        k -= 1
+    return (len(text) - k) % 2 == 1
 
-    A single quote-aware walk: `<<` inside a quoted region or after an unquoted `#`
-    (a comment) opens nothing; the delimiter word is consumed wholesale so its own
-    quotes never leak into the line's quote state.
+
+def _match_word(command, i, word):
+    """True when `word` sits at i as a whole bare word."""
+    if command[i:i + len(word)] != word:
+        return False
+    before = command[i - 1] if i else "\n"
+    after = command[i + len(word):i + len(word) + 1] or "\n"
+    return before in " \t\n;&|(" and after in " \t\n;&|)"
+
+
+@functools.lru_cache(maxsize=32)
+def _lex(command):
+    """One pass; returns (runs, heredoc_records).
+
+    runs = ((run_length, context, next_char), ...) for every maximal backslash run -
+    context "literal" where bash does no backslash processing (single quotes, quoted
+    heredoc bodies), "processed" elsewhere. Comment text and delimiter/terminator lines
+    yield nothing. heredoc_records = ((quoted, body_start, body_end, opener_pos), ...).
     """
-    out = []
-    in_s = in_d = False
-    k = 0
-    n = len(line)
-    while k < n:
-        ch = line[k]
-        if ch == "'" and not in_d:
-            in_s = not in_s
-        elif ch == '"' and not in_s:
-            in_d = not in_d
-        elif ch == "#" and not in_s and not in_d and (k == 0 or line[k - 1] in " \t;&|("):
-            break
-        elif (ch == "<" and not in_s and not in_d and line[k:k + 2] == "<<"
-              and line[k + 2:k + 3] != "<" and line[k - 1:k] != "<"):
-            m = re.match(r"<<(-?)\s*", line[k:])
-            word = _DELIM_WORD.match(line, k + m.end())
-            if word:
-                tag, quoted = _parse_delim(word.group())
-                out.append((k, m.group(1) == "-", tag, quoted))
-                k = word.end()
-                continue
-        k += 1
-    return out
-
-
-def _is_terminator(line, tag, dash):
-    """Bash requires the delimiter line to match exactly; <<- strips leading tabs only."""
-    line = line.rstrip("\r")
-    if dash:
-        line = line.lstrip("\t")
-    return line == tag
-
-
-@functools.lru_cache(maxsize=64)
-def heredoc_records(command):
-    """(quoted, body_start, body_end, opener_pos) per heredoc, in order - one linear walk.
-
-    Openers are collected per code line (quote-aware, comments open nothing), bodies are
-    assigned in bash's order (all openers of a line get their bodies sequentially after
-    it), and an opener whose terminator never comes is not a heredoc at all (an inline
-    `<<` in ordinary text).
-    """
-    lines = command.split("\n")
-    offsets = []
-    pos = 0
-    for ln in lines:
-        offsets.append(pos)
-        pos += len(ln) + 1
-    res = []
-    i = 0
-    while i < len(lines):
-        openers = _scan_openers(lines[i])
-        if not openers:
-            i += 1
-            continue
-        j = i + 1
-        assigned = False
-        for col, dash, tag, quoted in openers:
-            body_first = j
-            while j < len(lines) and not _is_terminator(lines[j], tag, dash):
-                j += 1
-            if j >= len(lines):
-                j = body_first
-                break
-            a = offsets[body_first]
-            res.append((quoted, a, max(a, offsets[j] - 1), offsets[i] + col))
-            j += 1
-            assigned = True
-        i = j if assigned else i + 1
-    return tuple(res)
-
-
-def heredocs(command):
-    """(quoted_delimiter: bool, body_start, body_end) - the classic view of heredoc_records."""
-    return tuple((q, a, b) for q, a, b, _pos in heredoc_records(command))
-
-
-# --- the quote/context scanner -----------------------------------------------------------
-
-def backslash_runs(command):
-    """Yield (run_length, context, next_char) for every maximal run of backslashes.
-
-    context is "literal" where bash does no backslash processing (single quotes, a quoted
-    heredoc body) and "processed" elsewhere (double quotes, bare words, unquoted heredocs).
-    The scanner tracks what bash tracks: comments are inert to the end of line, $( opens a
-    fresh quoting context (with bare subshell parens counted, so an inner `)` does not pop
-    it), quotes inside heredoc bodies are ordinary text - except that an UNQUOTED body
-    runs command substitutions for real, so a `$(` there re-enters full scanning.
-    """
-    records = heredoc_records(command)
-    body_spans = sorted((a, b, quoted) for quoted, a, b, _p in records)
-    span_idx = 0
     n = len(command)
+    runs = []
+    records = []
     i = 0
     in_single = in_double = in_comment = False
-    frames = []  # [saved_single, saved_double, paren_depth] per open $(
+    frames = []   # [saved_single, saved_double, paren_depth, case_depth] per open $(
+    pending = []  # opener queue: [tag, dash, quoted, opener_pos]
+    body = None   # active heredoc: [tag, dash, quoted, opener_pos, body_start, base_frames]
+    # base_frames = frame depth when the body began: an ENCLOSING $( (the heredoc lives
+    # inside a substitution) keeps the body running, while a $( opened FROM the body
+    # suspends it until that frame pops back to base
+
+    def start_next_body(pos):
+        return [*pending.pop(0), pos, len(frames)] if pending else None
+
     while i < n:
-        c = command[i]
-        while span_idx < len(body_spans) and body_spans[span_idx][1] <= i:
-            span_idx += 1
-        in_body = span_idx < len(body_spans) and body_spans[span_idx][0] <= i
-        body_quoted = in_body and body_spans[span_idx][2]
-        if in_body and not frames:
-            # a heredoc body outside any substitution: quotes/comments/parens are text
-            if c == "\\":
-                j = i
-                while j < n and command[j] == "\\":
-                    j += 1
-                yield j - i, ("literal" if body_quoted else "processed"), (command[j] if j < n else "")
-                i = j
-                continue
-            if not body_quoted and c == "$" and command[i + 1:i + 2] == "(":
-                frames.append([in_single, in_double, 0])
+        # ---- heredoc body mode (suspended while a substitution frame is open) ----------
+        if body is not None and len(frames) == body[5]:
+            tag, dash, quoted, opener_pos, body_start, _base = body
+            at_line_start = i == 0 or command[i - 1] == "\n"
+            eol = command.find("\n", i)
+            if eol < 0:
+                eol = n
+            if at_line_start:
+                term_line = command[i:eol]
+                term_end = eol
+                if not quoted:  # bash joins backslash-newline before the terminator check
+                    while _ends_with_odd_backslash(term_line) and term_end < n:
+                        nxt = command.find("\n", term_end + 1)
+                        if nxt < 0:
+                            nxt = n
+                        term_line = term_line[:-1] + command[term_end + 1:nxt]
+                        term_end = nxt
+                t = term_line.rstrip("\r")
+                if dash:
+                    t = t.lstrip("\t")
+                if t == tag:
+                    records.append((quoted, body_start, max(body_start, i - 1), opener_pos))
+                    i = term_end + 1  # the terminator line is inert - never scanned
+                    body = start_next_body(i)
+                    continue
+            k = i
+            while k < eol:
+                ch = command[k]
+                if ch == "\\":
+                    j = k
+                    while j < n and command[j] == "\\":
+                        j += 1
+                    runs.append((j - k, "literal" if quoted else "processed",
+                                 command[j] if j < n else ""))
+                    k = j
+                elif not quoted and ch == "$" and command[k + 1:k + 2] == "(":
+                    break  # an unquoted body runs substitutions for real
+                else:
+                    k += 1
+            if k < eol:  # broke on $(
+                frames.append([in_single, in_double, 0, 0])
                 in_single = in_double = False
-                i += 2
+                i = k + 2
                 continue
-            i += 1
+            i = eol + 1
             continue
+
+        # ---- normal shell scanning ------------------------------------------------------
+        c = command[i]
         if in_comment:
             if c == "\n":
                 in_comment = False
-            i += 1  # a comment is inert text - its backslashes are not runs, its quotes not quotes
+                if body is None and pending:
+                    body = start_next_body(i + 1)
+            i += 1
             continue
         if c == "\\":
             j = i
             while j < n and command[j] == "\\":
                 j += 1
             ctx = "literal" if in_single else "processed"
-            yield j - i, ctx, (command[j] if j < n else "")
-            if ctx == "processed" and (j - i) % 2 == 1 and j < n and command[j] in "\"'":
-                j += 1  # the quote is escaped - consume it without toggling
+            runs.append((j - i, ctx, command[j] if j < n else ""))
+            if ctx == "processed" and (j - i) % 2 == 1 and j < n:
+                if not in_double:
+                    j += 1  # bare context: the backslash escapes the next char outright
+                elif command[j] == '"':
+                    j += 1  # in double quotes an escaped quote must not toggle
             i = j
             continue
         if c == "'" and not in_double:
@@ -197,18 +172,54 @@ def backslash_runs(command):
         elif c == "#" and not in_single and not in_double and (i == 0 or command[i - 1] in " \t\n;&|("):
             in_comment = True
         elif c == "$" and not in_single and command[i + 1:i + 2] == "(":
-            frames.append([in_single, in_double, 0])
+            frames.append([in_single, in_double, 0, 0])
             in_single = in_double = False
             i += 2
             continue
         elif c == "(" and not in_single and not in_double and frames:
             frames[-1][2] += 1
         elif c == ")" and not in_single and not in_double and frames:
-            if frames[-1][2] > 0:
-                frames[-1][2] -= 1
+            f = frames[-1]
+            if f[3] > 0:
+                pass  # a case-pattern paren, not structure
+            elif f[2] > 0:
+                f[2] -= 1
             else:
-                in_single, in_double, _depth = frames.pop()
+                in_single, in_double, _d, _c = frames.pop()
+        elif c == "c" and frames and not in_single and not in_double and _match_word(command, i, "case"):
+            frames[-1][3] += 1
+        elif c == "e" and frames and not in_single and not in_double and _match_word(command, i, "esac"):
+            frames[-1][3] = max(0, frames[-1][3] - 1)
+        elif (c == "<" and not in_single and not in_double and command[i:i + 2] == "<<"
+              and command[i + 2:i + 3] != "<" and command[i - 1:i] != "<"):
+            m = re.compile(r"<<(-?)[ \t]*").match(command, i)
+            word = _DELIM_WORD.match(command, m.end())
+            if word:
+                tag, quoted = _parse_delim(word.group())
+                pending.append([tag, m.group(1) == "-", quoted, i])
+                i = word.end()
+                continue
+        elif c == "\n":
+            if body is None and pending:
+                body = start_next_body(i + 1)
         i += 1
+    # an opener whose terminator never comes is not a heredoc (its runs already stand)
+    return tuple(runs), tuple(records)
+
+
+def backslash_runs(command):
+    """(run_length, context, next_char) per maximal backslash run - see _lex."""
+    return _lex(command)[0]
+
+
+def heredoc_records(command):
+    """(quoted, body_start, body_end, opener_pos) per terminated heredoc, in order."""
+    return _lex(command)[1]
+
+
+def heredocs(command):
+    """(quoted_delimiter: bool, body_start, body_end) - the classic view of heredoc_records."""
+    return tuple((q, a, b) for q, a, b, _pos in heredoc_records(command))
 
 
 # --- PreToolUse rules --------------------------------------------------------------------
@@ -238,23 +249,42 @@ def rule_backslash_pair(command):
 
 
 _PROSE_SINK = re.compile(r"\b(git\s+commit|git\s+tag|gh\s+\w+)\b")
-_LIST_SEP = re.compile(r"&&|\|\||;")
 
 
 def sink_segment(command, opener_pos):
-    """The piece of the opener's line that owns THIS heredoc's `<<`: split on && || ; but
-    not on |, so `cat <<EOF | git commit -F -` keeps its sink while an earlier, unrelated
-    `git commit && cat <<EOF` - or a sibling heredoc's command - does not leak in."""
+    """The piece of the opener's line that owns THIS heredoc's `<<`: split on unquoted
+    && || ; but not on |, so `cat <<EOF | git commit -F -` keeps its sink while an
+    earlier, unrelated command - or a `;` inside a quoted argument - does not leak in."""
     start = command.rfind("\n", 0, opener_pos) + 1
     end = command.find("\n", opener_pos)
     line = command[start:] if end < 0 else command[start:end]
     op = opener_pos - start
+    seps = []
+    in_s = in_d = False
+    k = 0
+    while k < len(line):
+        ch = line[k]
+        if ch == "\\" and not in_s:
+            k += 2
+            continue
+        if ch == "'" and not in_d:
+            in_s = not in_s
+        elif ch == '"' and not in_s:
+            in_d = not in_d
+        elif not in_s and not in_d:
+            if line[k:k + 2] in ("&&", "||"):
+                seps.append((k, k + 2))
+                k += 2
+                continue
+            if ch == ";":
+                seps.append((k, k + 1))
+        k += 1
     lo = 0
-    for m in _LIST_SEP.finditer(line):
-        if m.end() <= op:
-            lo = m.end()
+    for a, b in seps:
+        if b <= op:
+            lo = b
         else:
-            return line[lo:m.start()]
+            return line[lo:a]
     return line[lo:]
 
 

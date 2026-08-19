@@ -82,6 +82,22 @@ EATEN = {
         "cat <<EOF\n$(printf '%s' 'x\\\\y')\nEOF\n",
     "multi-heredoc line: the prose sink owns its own heredoc ($5 in a commit message)":
         "git commit -F - <<A; cat <<B\ncost $5\nA\nplain\nB\n",
+    "axis1: heredoc inside command substitution inside double quotes":
+        "printf '%s' \"$(cat <<'EOF'\nx\\\\y\nEOF\n)\" > /tmp/h1.txt",
+    "axis1: <<EOF inside a multiline single-quoted string is not a heredoc (the pair is literal)":
+        "printf '%s' 'first\n<<EOF\nx\\\\y\nEOF\n' > /tmp/h2.txt",
+    "axis1: escaped space in a heredoc delimiter word (<<END\\ MSG)":
+        "cat <<END\\ MSG\nx\\\\y\nEND MSG\n",
+    "axis1: line-continuation joins an unquoted terminator (EO backslash newline F)":
+        "cat <<EOF\nEO\\\nF\nprintf '%s' 'x\\\\y'\nEOF\n",
+    "axis1: a quote in the terminator line must not desync the scanner":
+        "cat <<'E\"F'\nplain\nE\"F\nprintf '%s' 'x\\\\y' > /tmp/h3.txt",
+    "axis1: escaped paren inside command substitution must not pop the frame":
+        "echo \"$(printf '%s' \\); printf '%s' 'x\\\\y')\" > /tmp/h4.txt",
+    "axis1: case pattern paren inside command substitution must not pop the frame":
+        "echo \"$(case x in x) printf '%s' 'x\\\\y';; esac)\" > /tmp/h5.txt",
+    "multi-heredoc sink: a semicolon inside a quoted title is not a separator":
+        "gh pr create --title \"fix; details\" --body-file - <<EOF\ncost $5\nEOF\n",
     "unquoted heredoc with $ in the body (bash semantics, never meant)":
         "git commit -F - <<EOF\nrpath: $ORIGIN and $ORIGIN/../lib\nEOF\n",
     "unquoted heredoc with $ piped into git commit":
@@ -227,6 +243,38 @@ class PreRules(unittest.TestCase):
         self.assertIsNotNone(rules.rule_backslash_pair('printf "%s" "x\\\\$y"'), "pair before a double-quote-special char")
         self.assertIsNotNone(rules.rule_backslash_pair("printf '%s' 'x\\\\y'"), "any pair in single quotes is a byte change")
         self.assertIsNone(rules.rule_backslash_pair("printf '%s' 'x\\y'"), "lone backslashes survive")
+
+    def test_heredoc_inside_substitution_is_real_and_inside_single_quotes_is_not(self):
+        real = "printf '%s' \"$(cat <<'EOF'\nbody\nEOF\n)\""
+        docs = [(q, real[a:b]) for q, a, b in rules.heredocs(real)]
+        self.assertEqual([(True, "body")], docs)
+        fake = "printf '%s' 'first\n<<EOF\nx\nEOF\n'"
+        self.assertEqual((), tuple(rules.heredocs(fake)), "inside a multiline single-quoted string << is text")
+
+    def test_heredoc_delimiter_with_escaped_space(self):
+        cmd = "cat <<END\\ MSG\nbody\nEND MSG\n"
+        docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
+        self.assertEqual([(True, "body")], docs)
+
+    def test_unquoted_terminator_joins_line_continuations(self):
+        cmd = "cat <<EOF\nEO\\\nF\ntail\nEOF\n"
+        docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
+        self.assertEqual([(False, "")], docs, "EO backslash-newline F terminates the unquoted heredoc immediately")
+
+    def test_terminator_line_is_inert_to_the_scanner(self):
+        cmd = "cat <<'E\"F'\nplain\nE\"F\nprintf '%s' 'x\\\\y'"
+        runs = list(rules.backslash_runs(cmd))
+        self.assertEqual([(2, "literal", "y")], runs)
+
+    def test_escaped_paren_and_case_patterns_do_not_pop_frames(self):
+        esc = "echo \"$(printf '%s' \\); printf '%s' 'x\\\\y')\""
+        self.assertIn((2, "literal", "y"), list(rules.backslash_runs(esc)))
+        case = "echo \"$(case x in x) printf '%s' 'x\\\\y';; esac)\""
+        self.assertEqual([(2, "literal", "y")], list(rules.backslash_runs(case)))
+
+    def test_sink_separators_ignore_quoted_semicolons(self):
+        cmd = "gh pr create --title \"fix; details\" --body-file - <<EOF\ncost $5\nEOF\n"
+        self.assertIsNotNone(rules.rule_unquoted_heredoc_expansion(cmd))
 
     def test_heredoc_partially_quoted_delimiter_is_quoted_semantics(self):
         cmd = "cat <<E'OF'\nbody\nEOF\n"
