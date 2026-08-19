@@ -54,6 +54,14 @@ EATEN = {
         "cat > \"$D/dq.txt\" <<\"EOF\"\nx\\\\y\nEOF\n",
     "axis1: backslash pair in a dash heredoc (<<-'EOF')":
         "cat > \"$D/dash.txt\" <<-'EOF'\n\tx\\\\y\n\tEOF\n",
+    "axis1: pair in a quoted heredoc whose delimiter has a hyphen (<<'END-MSG')":
+        "cat > /tmp/hookbug/b.txt <<'END-MSG'\npair:x\\\\y end\nEND-MSG\n",
+    "axis1: pair in a quoted heredoc whose delimiter has a dot (<<'EOF.1')":
+        "cat > /tmp/hookbug/d.txt <<'EOF.1'\npair:x\\\\y end\nEOF.1\n",
+    "axis1: escaped double quote desyncs the scanner, pair in later single quotes":
+        "echo \"a\\\"b\" > /tmp/q.txt && printf '%s' 'x\\\\y' > /tmp/c.txt",
+    "axis1: apostrophe in an unquoted heredoc body desyncs the scanner, pair in later single quotes":
+        "cat <<EOF\nit's fine\nEOF\nprintf '%s' 'x\\\\y' > /tmp/e.txt",
     "unquoted heredoc with $ in the body (bash semantics, never meant)":
         "git commit -F - <<EOF\nrpath: $ORIGIN and $ORIGIN/../lib\nEOF\n",
     "unquoted heredoc with $ piped into git commit":
@@ -199,6 +207,20 @@ class PreRules(unittest.TestCase):
         self.assertIsNotNone(rules.rule_backslash_pair('printf "%s" "x\\\\$y"'), "pair before a double-quote-special char")
         self.assertIsNotNone(rules.rule_backslash_pair("printf '%s' 'x\\\\y'"), "any pair in single quotes is a byte change")
         self.assertIsNone(rules.rule_backslash_pair("printf '%s' 'x\\y'"), "lone backslashes survive")
+
+    def test_heredoc_delimiters_may_carry_hyphens_and_dots(self):
+        cmd = "cat <<'END-MSG'\na\nEND-MSG\ncat <<'EOF.1'\nb\nEOF.1\n"
+        docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
+        self.assertEqual([(True, "a"), (True, "b")], docs)
+
+    def test_escaped_quote_does_not_toggle_quote_state(self):
+        runs = list(rules.backslash_runs("echo \"a\\\"b\" 'c\\\\d'"))
+        self.assertEqual([(1, "processed", '"'), (2, "literal", "d")], runs)
+
+    def test_quotes_inside_heredoc_bodies_do_not_toggle_state(self):
+        cmd = "cat <<EOF\nit's fine\nEOF\nprintf '%s' 'x\\\\y'"
+        runs = list(rules.backslash_runs(cmd))
+        self.assertEqual([(2, "literal", "y")], runs)
 
     def test_heredoc_parser_sees_quoting(self):
         cmd = "cat <<'EOF'\na $b\nEOF\ncat <<X\nc\nX\n"

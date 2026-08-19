@@ -20,7 +20,7 @@ FIX_FILE = ("write the text/script to a file with the Write tool and pass the PA
 
 # --- PreToolUse: command shapes that get mangled ---------------------------------------
 
-_HEREDOC = re.compile(r"<<-?\s*(?P<q>['\"]?)(?P<tag>\w+)(?P=q)[^\n]*\n(?P<body>.*?)\n\s*(?P=tag)\s*$",
+_HEREDOC = re.compile(r"<<-?\s*(?P<q>['\"]?)(?P<tag>[\w.+-]+)(?P=q)[^\n]*\n(?P<body>.*?)\n\s*(?P=tag)\s*$",
                       re.S | re.M)
 _DQ_SPECIAL = set('"$`\\\n')
 
@@ -37,25 +37,35 @@ def backslash_runs(command):
 
     context is "literal" where bash does no backslash processing (single quotes, a quoted
     heredoc body) and "processed" elsewhere (double quotes, bare words, unquoted heredocs).
+    Quote characters inside ANY heredoc body are ordinary text, and a quote escaped by an
+    odd run of backslashes outside single quotes never toggles the state - both would
+    otherwise desync the scanner and misclassify everything after.
     """
     literal_spans = sorted((a, b) for quoted, a, b in heredocs(command) if quoted)
-    span_idx = 0
+    body_spans = sorted((a, b) for _quoted, a, b in heredocs(command))
+    lit_idx = body_idx = 0
     n = len(command)
     i = 0
     in_single = in_double = False
     while i < n:
         c = command[i]
-        while span_idx < len(literal_spans) and literal_spans[span_idx][1] <= i:
-            span_idx += 1
-        in_heredoc = span_idx < len(literal_spans) and literal_spans[span_idx][0] <= i
+        while lit_idx < len(literal_spans) and literal_spans[lit_idx][1] <= i:
+            lit_idx += 1
+        in_literal_heredoc = lit_idx < len(literal_spans) and literal_spans[lit_idx][0] <= i
+        while body_idx < len(body_spans) and body_spans[body_idx][1] <= i:
+            body_idx += 1
+        in_any_heredoc = body_idx < len(body_spans) and body_spans[body_idx][0] <= i
         if c == "\\":
             j = i
             while j < n and command[j] == "\\":
                 j += 1
-            yield j - i, ("literal" if in_single or in_heredoc else "processed"), (command[j] if j < n else "")
+            ctx = "literal" if in_single or in_literal_heredoc else "processed"
+            yield j - i, ctx, (command[j] if j < n else "")
+            if ctx == "processed" and (j - i) % 2 == 1 and j < n and command[j] in "\"'" and not in_any_heredoc:
+                j += 1  # the quote is escaped - consume it without toggling
             i = j
             continue
-        if not in_heredoc:
+        if not in_any_heredoc:
             if c == "'" and not in_double:
                 in_single = not in_single
             elif c == '"' and not in_single:
