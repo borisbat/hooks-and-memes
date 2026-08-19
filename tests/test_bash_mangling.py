@@ -62,6 +62,16 @@ EATEN = {
         "echo \"a\\\"b\" > /tmp/q.txt && printf '%s' 'x\\\\y' > /tmp/c.txt",
     "axis1: apostrophe in an unquoted heredoc body desyncs the scanner, pair in later single quotes":
         "cat <<EOF\nit's fine\nEOF\nprintf '%s' 'x\\\\y' > /tmp/e.txt",
+    "axis1: second heredoc on one opener line (cat <<A <<'B')":
+        "cat <<A <<'B'\nbody a\nA\npair:x\\\\y\nB\n",
+    "axis1: quoted heredoc delimiter with a colon (<<'END:MSG')":
+        "cat <<'END:MSG'\npair:x\\\\y\nEND:MSG\n",
+    "axis1: backslash-escaped heredoc delimiter (<<\\EOF is quoted semantics)":
+        "cat <<\\EOF\npair:x\\\\y\nEOF\n",
+    "axis1: apostrophe in a comment desyncs the scanner, pair in later single quotes":
+        "# it's a comment\nprintf '%s' 'x\\\\y' > /tmp/cm.txt",
+    "axis1: single-quoted pair inside command substitution inside double quotes":
+        "echo \"$(printf '%s' 'x\\\\y')\" > /tmp/cs.txt",
     "unquoted heredoc with $ in the body (bash semantics, never meant)":
         "git commit -F - <<EOF\nrpath: $ORIGIN and $ORIGIN/../lib\nEOF\n",
     "unquoted heredoc with $ piped into git commit":
@@ -208,6 +218,42 @@ class PreRules(unittest.TestCase):
         self.assertIsNotNone(rules.rule_backslash_pair("printf '%s' 'x\\\\y'"), "any pair in single quotes is a byte change")
         self.assertIsNone(rules.rule_backslash_pair("printf '%s' 'x\\y'"), "lone backslashes survive")
 
+    def test_heredoc_two_openers_one_line(self):
+        cmd = "cat <<A <<'B'\nbody a\nA\nbody b\nB\n"
+        docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
+        self.assertEqual([(False, "body a"), (True, "body b")], docs)
+
+    def test_heredoc_colon_and_escaped_delimiters(self):
+        cmd = "cat <<'END:MSG'\na\nEND:MSG\ncat <<\\EOF\nb\nEOF\n"
+        docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
+        self.assertEqual([(True, "a"), (True, "b")], docs)
+
+    def test_heredoc_opener_in_a_comment_is_not_an_opener(self):
+        self.assertEqual((), tuple(rules.heredocs("echo hi # <<EOF not real\nplain\nEOF\n")))
+
+    def test_comments_neither_toggle_state_nor_yield_runs(self):
+        runs = list(rules.backslash_runs("# it's a comment with \\\\ pairs\nprintf '%s' 'x\\\\y'"))
+        self.assertEqual([(2, "literal", "y")], runs)
+
+    def test_command_substitution_opens_a_fresh_quote_context(self):
+        runs = list(rules.backslash_runs("echo \"$(printf '%s' 'x\\\\y')\""))
+        self.assertEqual([(2, "literal", "y")], runs)
+        after = list(rules.backslash_runs("echo \"$(echo 'a')b\\\\c\""))
+        self.assertEqual([(2, "processed", "c")], after, "state is restored after the substitution closes")
+
+    def test_pre_check_is_linear_on_opener_floods(self):
+        import time
+        flood = ("# <<EOF comment line\n" * 7500) + "printf ok"
+        t0 = time.perf_counter()
+        self.assertIsNone(rules.pre_check(flood))
+        self.assertLess(time.perf_counter() - t0, 0.5, "a 7500-line command must not eat the hook timeout (timeout = fail-open bypass)")
+
+    def test_conservative_denials_are_deliberate(self):
+        # idempotent in these exact spellings, but the same shapes do change meaning in
+        # general ($'a\\nb' post-collapse contains a real newline) - the deny stays
+        self.assertIsNotNone(rules.rule_backslash_pair("printf '%s' x\\\\\\y"))
+        self.assertIsNotNone(rules.rule_backslash_pair("echo $'x\\\\y'"))
+
     def test_heredoc_delimiters_may_carry_hyphens_and_dots(self):
         cmd = "cat <<'END-MSG'\na\nEND-MSG\ncat <<'EOF.1'\nb\nEOF.1\n"
         docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
@@ -351,6 +397,20 @@ class PostHook(unittest.TestCase):
             with self.subTest(key):
                 self.assertEqual("v", bash_post.response_text({key: "v"}))
         self.assertIn("eval: line 0: syntax error", bash_post.response_text({"weird": {"nested": "eval: line 0: syntax error"}}))
+
+    def test_output_carries_context_in_both_documented_placements(self):
+        ev = {"tool_name": "Bash", "hook_event_name": "PostToolUse", "tool_input": {"command": "x"},
+              "tool_response": {"stdout": MANGLED_OUTPUT["eval syntax error"]}}
+        out = bash_post.decide(ev)
+        self.assertEqual(out["additionalContext"], out["hookSpecificOutput"]["additionalContext"],
+                         "the harness reads hookSpecificOutput.additionalContext; the reference documents top-level - emit both")
+
+    def test_failure_event_is_echoed_and_error_field_is_read(self):
+        ev = {"tool_name": "Bash", "hook_event_name": "PostToolUseFailure", "tool_input": {"command": "x"},
+              "error": MANGLED_OUTPUT["eval syntax error"]}
+        out = bash_post.decide(ev)
+        self.assertIsNotNone(out, "a failure event carries error, not tool_response")
+        self.assertEqual("PostToolUseFailure", out["hookSpecificOutput"]["hookEventName"])
 
     def test_decide_flags_only_mangled(self):
         ev = {"tool_name": "Bash", "tool_input": {"command": "x"}, "tool_response": {"stdout": MANGLED_OUTPUT["eval syntax error"]}}

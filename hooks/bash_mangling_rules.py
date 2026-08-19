@@ -20,16 +20,73 @@ FIX_FILE = ("write the text/script to a file with the Write tool and pass the PA
 
 # --- PreToolUse: command shapes that get mangled ---------------------------------------
 
-_HEREDOC = re.compile(r"<<-?\s*(?P<q>['\"]?)(?P<tag>[\w.+-]+)(?P=q)[^\n]*\n(?P<body>.*?)\n\s*(?P=tag)\s*$",
-                      re.S | re.M)
 _DQ_SPECIAL = set('"$`\\\n')
+
+# one heredoc opener token: <<[-] then a delimiter that is quoted ('tag' / "tag"),
+# backslash-escaped (\tag - quoted semantics too), or bare. <<< herestrings excluded.
+_OPENER = re.compile(
+    r"(?<!<)<<(?!<)(?P<dash>-?)\s*"
+    r"(?:'(?P<sq>[^'\n]+)'|\"(?P<dq>[^\"\n]+)\"|\\(?P<esc>[^\s;&|<>()]+)|(?P<bare>[^\s'\"\\;&|<>()]+))")
+
+
+def _strip_line_comment(line):
+    """The code part of one line: an unquoted # at a word start begins a comment."""
+    in_s = in_d = False
+    prev = " "
+    for k, ch in enumerate(line):
+        if ch == "'" and not in_d:
+            in_s = not in_s
+        elif ch == '"' and not in_s:
+            in_d = not in_d
+        elif ch == "#" and not in_s and not in_d and prev in " \t;&|(":
+            return line[:k]
+        prev = ch
+    return line
+
+
+def _is_terminator(line, tag, dash):
+    return (line.lstrip("\t") if dash else line).strip() == tag
 
 
 @functools.lru_cache(maxsize=64)
 def heredocs(command):
-    """(quoted_delimiter: bool, body_start, body_end) for every heredoc in the command -
-    one regex pass per command however many rules ask."""
-    return tuple((bool(m.group("q")), m.start("body"), m.end("body")) for m in _HEREDOC.finditer(command))
+    """(quoted_delimiter: bool, body_start, body_end) for every heredoc, in order.
+
+    A single line-walk, linear in the command size: openers are collected per code line
+    (comments stripped - `# <<EOF` opens nothing), bodies are assigned in bash's order
+    (all openers of a line get their bodies sequentially after it), and an opener whose
+    terminator never comes is not a heredoc at all (an inline `<<` in ordinary text).
+    """
+    lines = command.split("\n")
+    offsets = []
+    pos = 0
+    for ln in lines:
+        offsets.append(pos)
+        pos += len(ln) + 1
+    res = []
+    i = 0
+    while i < len(lines):
+        openers = list(_OPENER.finditer(_strip_line_comment(lines[i])))
+        if not openers:
+            i += 1
+            continue
+        j = i + 1
+        assigned = False
+        for m in openers:
+            tag = m.group("sq") or m.group("dq") or m.group("esc") or m.group("bare")
+            dash = m.group("dash") == "-"
+            body_first = j
+            while j < len(lines) and not _is_terminator(lines[j], tag, dash):
+                j += 1
+            if j >= len(lines):
+                j = body_first
+                break
+            a = offsets[body_first]
+            res.append((m.group("bare") is None, a, max(a, offsets[j] - 1)))
+            j += 1
+            assigned = True
+        i = j if assigned else i + 1
+    return tuple(res)
 
 
 def backslash_runs(command):
@@ -46,30 +103,54 @@ def backslash_runs(command):
     lit_idx = body_idx = 0
     n = len(command)
     i = 0
-    in_single = in_double = False
+    in_single = in_double = in_comment = False
+    saved_quotes = []  # (in_single, in_double) at each $( entry - substitutions restart quoting
     while i < n:
         c = command[i]
-        while lit_idx < len(literal_spans) and literal_spans[lit_idx][1] <= i:
-            lit_idx += 1
-        in_literal_heredoc = lit_idx < len(literal_spans) and literal_spans[lit_idx][0] <= i
         while body_idx < len(body_spans) and body_spans[body_idx][1] <= i:
             body_idx += 1
-        in_any_heredoc = body_idx < len(body_spans) and body_spans[body_idx][0] <= i
+        if body_idx < len(body_spans) and body_spans[body_idx][0] <= i:
+            # inside a heredoc body: quotes, comments and parens are ordinary text
+            if c == "\\":
+                j = i
+                while j < n and command[j] == "\\":
+                    j += 1
+                while lit_idx < len(literal_spans) and literal_spans[lit_idx][1] <= i:
+                    lit_idx += 1
+                in_literal = lit_idx < len(literal_spans) and literal_spans[lit_idx][0] <= i
+                yield j - i, ("literal" if in_literal else "processed"), (command[j] if j < n else "")
+                i = j
+                continue
+            i += 1
+            continue
+        if in_comment:
+            if c == "\n":
+                in_comment = False
+            i += 1  # a comment is inert text - its backslashes are not runs, its quotes not quotes
+            continue
         if c == "\\":
             j = i
             while j < n and command[j] == "\\":
                 j += 1
-            ctx = "literal" if in_single or in_literal_heredoc else "processed"
+            ctx = "literal" if in_single else "processed"
             yield j - i, ctx, (command[j] if j < n else "")
-            if ctx == "processed" and (j - i) % 2 == 1 and j < n and command[j] in "\"'" and not in_any_heredoc:
+            if ctx == "processed" and (j - i) % 2 == 1 and j < n and command[j] in "\"'":
                 j += 1  # the quote is escaped - consume it without toggling
             i = j
             continue
-        if not in_any_heredoc:
-            if c == "'" and not in_double:
-                in_single = not in_single
-            elif c == '"' and not in_single:
-                in_double = not in_double
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            in_double = not in_double
+        elif c == "#" and not in_single and not in_double and (i == 0 or command[i - 1] in " \t\n;&|("):
+            in_comment = True
+        elif c == "$" and not in_single and i + 1 < n and command[i + 1] == "(":
+            saved_quotes.append((in_single, in_double))
+            in_single = in_double = False
+            i += 2
+            continue
+        elif c == ")" and saved_quotes and not in_single and not in_double:
+            in_single, in_double = saved_quotes.pop()
         i += 1
 
 
