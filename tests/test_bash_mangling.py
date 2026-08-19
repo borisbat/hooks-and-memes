@@ -72,6 +72,16 @@ EATEN = {
         "# it's a comment\nprintf '%s' 'x\\\\y' > /tmp/cm.txt",
     "axis1: single-quoted pair inside command substitution inside double quotes":
         "echo \"$(printf '%s' 'x\\\\y')\" > /tmp/cs.txt",
+    "axis1: partially quoted heredoc delimiter (<<E'OF' means literal EOF body)":
+        "cat <<E'OF'\nx\\\\y\nEOF\n",
+    "axis1: an indented would-be terminator is body text, the heredoc runs on":
+        "cat <<'EOF'\n EOF\nx\\\\y\nEOF\n",
+    "axis1: subshell parens inside command substitution must not pop the context early":
+        "echo \"$( ( echo inner ); printf '%s' 'x\\\\y')\" > /tmp/f.txt",
+    "axis1: command substitution runs inside an unquoted heredoc body":
+        "cat <<EOF\n$(printf '%s' 'x\\\\y')\nEOF\n",
+    "multi-heredoc line: the prose sink owns its own heredoc ($5 in a commit message)":
+        "git commit -F - <<A; cat <<B\ncost $5\nA\nplain\nB\n",
     "unquoted heredoc with $ in the body (bash semantics, never meant)":
         "git commit -F - <<EOF\nrpath: $ORIGIN and $ORIGIN/../lib\nEOF\n",
     "unquoted heredoc with $ piped into git commit":
@@ -218,6 +228,41 @@ class PreRules(unittest.TestCase):
         self.assertIsNotNone(rules.rule_backslash_pair("printf '%s' 'x\\\\y'"), "any pair in single quotes is a byte change")
         self.assertIsNone(rules.rule_backslash_pair("printf '%s' 'x\\y'"), "lone backslashes survive")
 
+    def test_heredoc_partially_quoted_delimiter_is_quoted_semantics(self):
+        cmd = "cat <<E'OF'\nbody\nEOF\n"
+        docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
+        self.assertEqual([(True, "body")], docs)
+
+    def test_heredoc_terminator_must_match_exactly(self):
+        cmd = "cat <<'EOF'\n EOF\ntail\nEOF\n"
+        docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
+        self.assertEqual([(True, " EOF\ntail")], docs, "an indented EOF line is body, not terminator")
+        dash = "cat <<-'EOF'\n\tbody\n\tEOF\n"
+        docs2 = [(q, dash[a:b]) for q, a, b in rules.heredocs(dash)]
+        self.assertEqual([(True, "\tbody")], docs2, "<<- still allows tab-indented terminators")
+
+    def test_heredoc_opener_inside_quotes_is_not_an_opener(self):
+        self.assertEqual((), tuple(rules.heredocs("echo \"a <<EOF b\"\nx\nEOF\n")))
+        self.assertEqual((), tuple(rules.heredocs("echo 'a <<EOF b'\nx\nEOF\n")))
+
+    def test_subshell_parens_do_not_pop_the_substitution_context(self):
+        runs = list(rules.backslash_runs("echo \"$( ( echo inner ); printf '%s' 'x\\\\y')\""))
+        self.assertEqual([(2, "literal", "y")], runs)
+
+    def test_substitution_inside_unquoted_heredoc_body_is_scanned(self):
+        cmd = "cat <<EOF\n$(printf '%s' 'x\\\\y')\nEOF\n"
+        runs = list(rules.backslash_runs(cmd))
+        self.assertEqual([(2, "literal", "y")], runs)
+        quoted = "cat <<'EOF'\n$(printf '%s' 'x\\\\y')\nEOF\n"
+        runs2 = list(rules.backslash_runs(quoted))
+        self.assertEqual([(2, "literal", "y")], runs2, "a quoted body is one literal span - the pair is still a byte change")
+
+    def test_each_heredoc_owns_its_own_sink_segment(self):
+        cmd = "git commit -F - <<A; cat <<B\ncost $5\nA\nplain\nB\n"
+        self.assertIsNotNone(rules.rule_unquoted_heredoc_expansion(cmd), "the commit message heredoc has the sink")
+        flipped = "cat <<A; git commit -F - <<B\ncost $5\nA\nplain\nB\n"
+        self.assertIsNone(rules.rule_unquoted_heredoc_expansion(flipped), "the $ body belongs to cat, not the sink")
+
     def test_heredoc_two_openers_one_line(self):
         cmd = "cat <<A <<'B'\nbody a\nA\nbody b\nB\n"
         docs = [(q, cmd[a:b]) for q, a, b in rules.heredocs(cmd)]
@@ -275,11 +320,11 @@ class PreRules(unittest.TestCase):
 
     def test_sink_segment_owns_only_the_heredoc_operator(self):
         cmd = "gh pr view 1; cat <<EOF | git commit -F -\nv\nEOF\n"
-        a = next(iter(rules.heredocs(cmd)))[1]
-        self.assertEqual(" cat <<EOF | git commit -F -", rules.sink_segment(cmd, a))
+        pos = next(iter(rules.heredoc_records(cmd)))[3]
+        self.assertEqual(" cat <<EOF | git commit -F -", rules.sink_segment(cmd, pos))
         cmd2 = "git commit -m x\ncat <<EOF\nv\nEOF\n"
-        a2 = next(iter(rules.heredocs(cmd2)))[1]
-        self.assertEqual("cat <<EOF", rules.sink_segment(cmd2, a2))
+        pos2 = next(iter(rules.heredoc_records(cmd2)))[3]
+        self.assertEqual("cat <<EOF", rules.sink_segment(cmd2, pos2))
 
     def test_double_quote_tracking_keeps_nested_single_quotes_processed(self):
         runs = list(rules.backslash_runs("python -c \"print('D:\\\\MCP')\""))
@@ -398,12 +443,13 @@ class PostHook(unittest.TestCase):
                 self.assertEqual("v", bash_post.response_text({key: "v"}))
         self.assertIn("eval: line 0: syntax error", bash_post.response_text({"weird": {"nested": "eval: line 0: syntax error"}}))
 
-    def test_output_carries_context_in_both_documented_placements(self):
+    def test_output_carries_context_nested_only(self):
         ev = {"tool_name": "Bash", "hook_event_name": "PostToolUse", "tool_input": {"command": "x"},
               "tool_response": {"stdout": MANGLED_OUTPUT["eval syntax error"]}}
         out = bash_post.decide(ev)
-        self.assertEqual(out["additionalContext"], out["hookSpecificOutput"]["additionalContext"],
-                         "the harness reads hookSpecificOutput.additionalContext; the reference documents top-level - emit both")
+        self.assertIn("shell-ate-it", out["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("additionalContext", set(out) - {"hookSpecificOutput"},
+                         "a top-level copy draws an unrecognized-key warning from the harness (2.1.235)")
 
     def test_failure_event_is_echoed_and_error_field_is_read(self):
         ev = {"tool_name": "Bash", "hook_event_name": "PostToolUseFailure", "tool_input": {"command": "x"},
@@ -415,7 +461,7 @@ class PostHook(unittest.TestCase):
     def test_decide_flags_only_mangled(self):
         ev = {"tool_name": "Bash", "tool_input": {"command": "x"}, "tool_response": {"stdout": MANGLED_OUTPUT["eval syntax error"]}}
         out = bash_post.decide(ev)
-        self.assertIn("shell-ate-it", out["additionalContext"])
+        self.assertIn("shell-ate-it", out["hookSpecificOutput"]["additionalContext"])
         self.assertEqual("PostToolUse", out["hookSpecificOutput"]["hookEventName"])
         quiet = {"tool_name": "Bash", "tool_input": {"command": "x"}, "tool_response": {"stdout": CLEAN_OUTPUT["clean success"]}}
         self.assertIsNone(bash_post.decide(quiet))
@@ -425,7 +471,7 @@ class PostHook(unittest.TestCase):
         ev = {"tool_name": "Bash", "tool_input": {"command": "x"}, "tool_response": {"stdout": MANGLED_OUTPUT["wrapper tail only (the non-ASCII class leaves just this)"]}}
         r = run_hook("bash_post.py", ev)
         self.assertEqual(0, r.returncode)
-        self.assertIn("shell-ate-it", json.loads(r.stdout)["additionalContext"])
+        self.assertIn("shell-ate-it", json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"])
         r2 = run_hook("bash_post.py", {"tool_name": "Bash", "tool_input": {"command": "x"}, "tool_response": "fine"})
         self.assertEqual(0, r2.returncode)
         self.assertEqual("", r2.stdout.strip())
@@ -434,7 +480,7 @@ class PostHook(unittest.TestCase):
         ev = {"tool_name": "Bash", "tool_input": {"command": "printf '%s' 'lit:D:\\\\MCP\\\\x'"}, "tool_response": {"stdout": "", "stderr": ""}}
         out = bash_post.decide(ev)
         self.assertIsNotNone(out, "a silent backslash-collapse run must be flagged from the command")
-        self.assertIn("backslash run", out["additionalContext"])
+        self.assertIn("backslash run", out["hookSpecificOutput"]["additionalContext"])
 
     def test_fails_open_when_the_rules_module_is_missing(self):
         r = subprocess.run([sys.executable, "-c",

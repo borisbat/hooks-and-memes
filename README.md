@@ -44,8 +44,8 @@ Two hooks, one per phase:
   mangled and its side effects are not to be trusted. Register it for BOTH events: on this
   harness a nonzero Bash exit routes through `PostToolUseFailure` (with a top-level `error`
   instead of `tool_response`), and only exit-0 runs through `PostToolUse`. The context is
-  emitted in both documented placements (top-level `additionalContext` per the reference,
-  `hookSpecificOutput.additionalContext` which is what the harness actually reads).
+  emitted as `hookSpecificOutput.additionalContext` - the placement the harness reads; a
+  top-level copy draws an unrecognized-key warning (observed on 2.1.235).
 
 Rules and fingerprints live in `hooks/bash_mangling_rules.py` (pure functions); the hooks are
 thin I/O wrappers that fail open — a crashing hook (even a broken rules import) never

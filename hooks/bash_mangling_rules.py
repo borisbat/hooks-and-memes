@@ -1,6 +1,7 @@
 """Detection rules for the "shell ate it" class: Bash tool commands the Claude Code harness
 mangles before bash runs them, and the fingerprints a mangled run leaves in its output.
-Pure functions - the hooks are thin wrappers.
+Pure functions - the hooks are thin wrappers. Scope: Claude Code on WINDOWS (the Git-Bash
+spawn path); see README.
 
 Two mangling axes, each byte-proven against a file-run control (see tests/ corpus):
   1. a run of N>=2 backslashes arrives as ceil(N/2) - in single quotes, in <<'EOF' bodies,
@@ -18,44 +19,85 @@ import re
 FIX_FILE = ("write the text/script to a file with the Write tool and pass the PATH "
             "(python script.py, --body-file FILE, -F body=@FILE, git commit -F FILE)")
 
-# --- PreToolUse: command shapes that get mangled ---------------------------------------
+# --- heredoc parsing ---------------------------------------------------------------------
 
 _DQ_SPECIAL = set('"$`\\\n')
 
-# one heredoc opener token: <<[-] then a delimiter that is quoted ('tag' / "tag"),
-# backslash-escaped (\tag - quoted semantics too), or bare. <<< herestrings excluded.
-_OPENER = re.compile(
-    r"(?<!<)<<(?!<)(?P<dash>-?)\s*"
-    r"(?:'(?P<sq>[^'\n]+)'|\"(?P<dq>[^\"\n]+)\"|\\(?P<esc>[^\s;&|<>()]+)|(?P<bare>[^\s'\"\\;&|<>()]+))")
+# a heredoc delimiter WORD: any mix of quoted segments, escaped chars and bare chars -
+# bash applies quote removal to get the tag, and ANY quoting anywhere makes it literal
+_DELIM_WORD = re.compile(r"(?:'[^'\n]*'|\"[^\"\n]*\"|\\[^\s]|[^\s'\"\\;&|<>()])+")
 
 
-def _strip_line_comment(line):
-    """The code part of one line: an unquoted # at a word start begins a comment."""
+def _parse_delim(word):
+    """(tag, quoted) after bash quote removal on the delimiter word."""
+    tag = []
+    quoted = False
+    k = 0
+    while k < len(word):
+        ch = word[k]
+        if ch == "'" or ch == '"':
+            end = word.index(ch, k + 1)
+            tag.append(word[k + 1:end])
+            quoted = True
+            k = end + 1
+        elif ch == "\\":
+            tag.append(word[k + 1:k + 2])
+            quoted = True
+            k += 2
+        else:
+            tag.append(ch)
+            k += 1
+    return "".join(tag), quoted
+
+
+def _scan_openers(line):
+    """(pos_in_line, dash, tag, quoted) for each heredoc opener on one code line.
+
+    A single quote-aware walk: `<<` inside a quoted region or after an unquoted `#`
+    (a comment) opens nothing; the delimiter word is consumed wholesale so its own
+    quotes never leak into the line's quote state.
+    """
+    out = []
     in_s = in_d = False
-    prev = " "
-    for k, ch in enumerate(line):
+    k = 0
+    n = len(line)
+    while k < n:
+        ch = line[k]
         if ch == "'" and not in_d:
             in_s = not in_s
         elif ch == '"' and not in_s:
             in_d = not in_d
-        elif ch == "#" and not in_s and not in_d and prev in " \t;&|(":
-            return line[:k]
-        prev = ch
-    return line
+        elif ch == "#" and not in_s and not in_d and (k == 0 or line[k - 1] in " \t;&|("):
+            break
+        elif (ch == "<" and not in_s and not in_d and line[k:k + 2] == "<<"
+              and line[k + 2:k + 3] != "<" and line[k - 1:k] != "<"):
+            m = re.match(r"<<(-?)\s*", line[k:])
+            word = _DELIM_WORD.match(line, k + m.end())
+            if word:
+                tag, quoted = _parse_delim(word.group())
+                out.append((k, m.group(1) == "-", tag, quoted))
+                k = word.end()
+                continue
+        k += 1
+    return out
 
 
 def _is_terminator(line, tag, dash):
-    return (line.lstrip("\t") if dash else line).strip() == tag
+    """Bash requires the delimiter line to match exactly; <<- strips leading tabs only."""
+    line = line.rstrip("\r")
+    if dash:
+        line = line.lstrip("\t")
+    return line == tag
 
 
 @functools.lru_cache(maxsize=64)
-def heredocs(command):
-    """(quoted_delimiter: bool, body_start, body_end) for every heredoc, in order.
+def heredoc_records(command):
+    """(quoted, body_start, body_end, opener_pos) per heredoc, in order - one linear walk.
 
-    A single line-walk, linear in the command size: openers are collected per code line
-    (comments stripped - `# <<EOF` opens nothing), bodies are assigned in bash's order
-    (all openers of a line get their bodies sequentially after it), and an opener whose
-    terminator never comes is not a heredoc at all (an inline `<<` in ordinary text).
+    Openers are collected per code line (quote-aware, comments open nothing), bodies are
+    assigned in bash's order (all openers of a line get their bodies sequentially after
+    it), and an opener whose terminator never comes is not a heredoc at all (an inline
+    `<<` in ordinary text).
     """
     lines = command.split("\n")
     offsets = []
@@ -66,15 +108,13 @@ def heredocs(command):
     res = []
     i = 0
     while i < len(lines):
-        openers = list(_OPENER.finditer(_strip_line_comment(lines[i])))
+        openers = _scan_openers(lines[i])
         if not openers:
             i += 1
             continue
         j = i + 1
         assigned = False
-        for m in openers:
-            tag = m.group("sq") or m.group("dq") or m.group("esc") or m.group("bare")
-            dash = m.group("dash") == "-"
+        for col, dash, tag, quoted in openers:
             body_first = j
             while j < len(lines) and not _is_terminator(lines[j], tag, dash):
                 j += 1
@@ -82,44 +122,56 @@ def heredocs(command):
                 j = body_first
                 break
             a = offsets[body_first]
-            res.append((m.group("bare") is None, a, max(a, offsets[j] - 1)))
+            res.append((quoted, a, max(a, offsets[j] - 1), offsets[i] + col))
             j += 1
             assigned = True
         i = j if assigned else i + 1
     return tuple(res)
 
 
+def heredocs(command):
+    """(quoted_delimiter: bool, body_start, body_end) - the classic view of heredoc_records."""
+    return tuple((q, a, b) for q, a, b, _pos in heredoc_records(command))
+
+
+# --- the quote/context scanner -----------------------------------------------------------
+
 def backslash_runs(command):
     """Yield (run_length, context, next_char) for every maximal run of backslashes.
 
     context is "literal" where bash does no backslash processing (single quotes, a quoted
     heredoc body) and "processed" elsewhere (double quotes, bare words, unquoted heredocs).
-    Quote characters inside ANY heredoc body are ordinary text, and a quote escaped by an
-    odd run of backslashes outside single quotes never toggles the state - both would
-    otherwise desync the scanner and misclassify everything after.
+    The scanner tracks what bash tracks: comments are inert to the end of line, $( opens a
+    fresh quoting context (with bare subshell parens counted, so an inner `)` does not pop
+    it), quotes inside heredoc bodies are ordinary text - except that an UNQUOTED body
+    runs command substitutions for real, so a `$(` there re-enters full scanning.
     """
-    literal_spans = sorted((a, b) for quoted, a, b in heredocs(command) if quoted)
-    body_spans = sorted((a, b) for _quoted, a, b in heredocs(command))
-    lit_idx = body_idx = 0
+    records = heredoc_records(command)
+    body_spans = sorted((a, b, quoted) for quoted, a, b, _p in records)
+    span_idx = 0
     n = len(command)
     i = 0
     in_single = in_double = in_comment = False
-    saved_quotes = []  # (in_single, in_double) at each $( entry - substitutions restart quoting
+    frames = []  # [saved_single, saved_double, paren_depth] per open $(
     while i < n:
         c = command[i]
-        while body_idx < len(body_spans) and body_spans[body_idx][1] <= i:
-            body_idx += 1
-        if body_idx < len(body_spans) and body_spans[body_idx][0] <= i:
-            # inside a heredoc body: quotes, comments and parens are ordinary text
+        while span_idx < len(body_spans) and body_spans[span_idx][1] <= i:
+            span_idx += 1
+        in_body = span_idx < len(body_spans) and body_spans[span_idx][0] <= i
+        body_quoted = in_body and body_spans[span_idx][2]
+        if in_body and not frames:
+            # a heredoc body outside any substitution: quotes/comments/parens are text
             if c == "\\":
                 j = i
                 while j < n and command[j] == "\\":
                     j += 1
-                while lit_idx < len(literal_spans) and literal_spans[lit_idx][1] <= i:
-                    lit_idx += 1
-                in_literal = lit_idx < len(literal_spans) and literal_spans[lit_idx][0] <= i
-                yield j - i, ("literal" if in_literal else "processed"), (command[j] if j < n else "")
+                yield j - i, ("literal" if body_quoted else "processed"), (command[j] if j < n else "")
                 i = j
+                continue
+            if not body_quoted and c == "$" and command[i + 1:i + 2] == "(":
+                frames.append([in_single, in_double, 0])
+                in_single = in_double = False
+                i += 2
                 continue
             i += 1
             continue
@@ -144,15 +196,22 @@ def backslash_runs(command):
             in_double = not in_double
         elif c == "#" and not in_single and not in_double and (i == 0 or command[i - 1] in " \t\n;&|("):
             in_comment = True
-        elif c == "$" and not in_single and i + 1 < n and command[i + 1] == "(":
-            saved_quotes.append((in_single, in_double))
+        elif c == "$" and not in_single and command[i + 1:i + 2] == "(":
+            frames.append([in_single, in_double, 0])
             in_single = in_double = False
             i += 2
             continue
-        elif c == ")" and saved_quotes and not in_single and not in_double:
-            in_single, in_double = saved_quotes.pop()
+        elif c == "(" and not in_single and not in_double and frames:
+            frames[-1][2] += 1
+        elif c == ")" and not in_single and not in_double and frames:
+            if frames[-1][2] > 0:
+                frames[-1][2] -= 1
+            else:
+                in_single, in_double, _depth = frames.pop()
         i += 1
 
+
+# --- PreToolUse rules --------------------------------------------------------------------
 
 def rule_non_ascii(command):
     bad = sorted({c for c in command if ord(c) > 127})
@@ -182,15 +241,14 @@ _PROSE_SINK = re.compile(r"\b(git\s+commit|git\s+tag|gh\s+\w+)\b")
 _LIST_SEP = re.compile(r"&&|\|\||;")
 
 
-def sink_segment(command, body_start):
-    """The piece of the heredoc's opener line that owns the `<<`: split on && || ; but not
-    on |, so `cat <<EOF | git commit -F -` keeps its sink while an earlier, unrelated
-    `git commit && cat <<EOF` does not leak into this heredoc."""
-    head = command[:body_start].rstrip("\n")
-    line = head[head.rfind("\n") + 1:]
-    op = line.rfind("<<")
-    if op < 0:
-        return line
+def sink_segment(command, opener_pos):
+    """The piece of the opener's line that owns THIS heredoc's `<<`: split on && || ; but
+    not on |, so `cat <<EOF | git commit -F -` keeps its sink while an earlier, unrelated
+    `git commit && cat <<EOF` - or a sibling heredoc's command - does not leak in."""
+    start = command.rfind("\n", 0, opener_pos) + 1
+    end = command.find("\n", opener_pos)
+    line = command[start:] if end < 0 else command[start:end]
+    op = opener_pos - start
     lo = 0
     for m in _LIST_SEP.finditer(line):
         if m.end() <= op:
@@ -204,9 +262,9 @@ def rule_unquoted_heredoc_expansion(command):
     """<<EOF (no quotes) expands $ and backticks inside the body - bash semantics, not the
     harness, and fine when meant; but a commit message or PR body fed that way never means
     it, so only prose sinks (git commit/tag, gh) are denied."""
-    for quoted, a, b in heredocs(command):
+    for quoted, a, b, pos in heredoc_records(command):
         body = command[a:b]
-        if not quoted and ("$" in body or "`" in body) and _PROSE_SINK.search(sink_segment(command, a)):
+        if not quoted and ("$" in body or "`" in body) and _PROSE_SINK.search(sink_segment(command, pos)):
             return ("heredoc delimiter is unquoted, so $... and `...` inside the message expand "
                     "before the program sees it; quote it (<<'EOF') or " + FIX_FILE)
     return None

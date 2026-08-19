@@ -45,15 +45,13 @@ def decide(event):
     msg = post_check(command, text)
     if not msg:
         return None
-    # additionalContext rides in BOTH documented placements: the hooks reference shows it
-    # top-level for PostToolUse, real harnesses have read hookSpecificOutput.additionalContext -
-    # emitting both is accepted by either schema and costs a few bytes
+    # hookSpecificOutput.additionalContext is the placement the harness reads; a top-level
+    # copy draws an unrecognized-key warning (Claude Code 2.1.235)
     return {
         "hookSpecificOutput": {
             "hookEventName": event.get("hook_event_name") or "PostToolUse",
             "additionalContext": msg,
         },
-        "additionalContext": msg,
         "systemMessage": "shell-ate-it: the last Bash command was mangled by the harness",
     }
 
