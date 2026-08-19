@@ -5,26 +5,40 @@ with the corpus of real failures that motivated each as its test suite.
 
 ## bash: the "shell ate it" class
 
-The Bash tool's command text passes through a harness wrapper (`eval '...'`) before bash
-runs it. Some shapes do not survive that trip: backticks expand even inside single quotes
-or heredocs, and scripts fed to an interpreter through a heredoc come out with quotes and
-backslashes rewritten. The command then runs *something else* — often partially, often
-exit 127 with a page of `command not found` — and the model, having seen it "succeed" or
-fail confusingly, moves on.
+The Bash tool's command text passes through a harness wrapper before bash runs it. Two
+shapes do not survive that trip — both established by running probes *through the Bash
+tool itself* and comparing bytes against a file-run control:
+
+1. **Backslash runs collapse**: N consecutive backslashes (N ≥ 2) arrive as ⌈N/2⌉ — inside
+   single quotes, inside `<<'EOF'` heredoc bodies, in `-c` strings, everywhere. Lone
+   backslashes survive. The program then runs with the *wrong bytes and no error*: a
+   `sed` expression that no longer parses, a Python `\\n` that became a newline, a
+   `replace()` that silently no-ops.
+2. **Non-ASCII kills the command**: any codepoint above U+007F (an em dash in a PR reply,
+   smart quotes in a commit message) makes the wrapper's re-quoting fail — exit 127, a
+   cascade of `command not found`, and the `pwd -P >| …-cwd: No such file or directory`
+   tail — before bash runs anything.
+
+Backticks, `$(…)`, `${…}` and quoted heredocs behave exactly as bash defines them.
 
 Two hooks, one per phase:
 
-- `hooks/bash_pre.py` — **PreToolUse**: denies the shapes that get mangled (backtick anywhere,
-  `python - <<EOF` style interpreter heredocs, unquoted heredocs with `$` in the body). The
+- `hooks/bash_pre.py` — **PreToolUse**: denies commands with a collapsing backslash run
+  (context-aware: a `\\` pair in double quotes before an ordinary character is fine, bash
+  collapses it too) or any non-ASCII character, and — the one bash-semantics guard —
+  an unquoted heredoc with `$`/backticks feeding a prose sink (`git commit`, `gh …`). The
   deny message names the fix: write the text or script to a file with the Write tool and
   pass the path (`--body-file`, `-F body=@file`, `python script.py`, `git commit -F file`).
 - `hooks/bash_post.py` — **PostToolUse**: when the output carries a mangling fingerprint
-  (the wrapper's `pwd -P >| ...-cwd` tail, `eval: line 0: syntax error`, command-substitution
-  syntax errors, a `command not found` cascade followed by the wrapper dump), it tells the
-  model in context that the run was mangled and its side effects are not to be trusted.
+  (the wrapper tail, `eval: … syntax error`, command-substitution syntax errors, a
+  `command not found` cascade ending in the wrapper dump, Python's `SyntaxWarning: invalid
+  escape sequence`, sed's `unterminated`), or when the command itself carried a collapsing
+  backslash run and the output is quiet, it tells the model in context that the run was
+  mangled and its side effects are not to be trusted.
 
 Rules and fingerprints live in `hooks/bash_mangling_rules.py` (pure functions); the hooks are
-thin I/O wrappers that fail open — a crashing hook never blocks a command.
+thin I/O wrappers that fail open — a crashing hook (even a broken rules import) never
+blocks a command.
 
 ### Install (user scope, all projects)
 
@@ -54,7 +68,11 @@ on Windows; use `python3` where that is the real binary. Restart the session aft
 python tests/test_bash_mangling.py
 ```
 
-The corpus is the contract: `EATEN` are commands the harness actually mangled (every one
-must be denied), `OK` are shapes that ran fine (every one must stay allowed),
+The corpus is the contract: `EATEN` are commands the harness mangled (every one must be
+denied), `OK` are shapes that came through byte-exact (every one must stay allowed),
 `MANGLED_OUTPUT` / `CLEAN_OUTPUT` are verbatim outputs (flagged / quiet). Add to the corpus
 before touching a rule; a rule change that flips a corpus entry is a finding, not a fix.
+
+Provenance: the first cut of this hook blamed backticks, from a day of failures that all
+turned out to contain an em dash. The probe pass replaced belief with bytes; if the harness
+changes, re-run the probes before trusting either list.
