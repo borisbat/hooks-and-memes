@@ -3,11 +3,17 @@ mangles before bash runs them, and the fingerprints a mangled run leaves in its 
 Pure functions - the hooks are thin wrappers. Scope: Claude Code on WINDOWS (the Git-Bash
 spawn path); see README.
 
-Two mangling axes, each byte-proven against a file-run control (see tests/ corpus):
-  1. a run of N>=2 backslashes arrives as ceil(N/2) - in single quotes, in <<'EOF' bodies,
-     in -c strings, everywhere; lone backslashes survive
-  2. any codepoint above U+007F makes the wrapper's re-quoting fail: exit 127 and the
-     `pwd -P >|...-cwd` dump, before bash runs anything
+One live mangling axis, byte-proven against a file-run control (see tests/ corpus):
+a run of N>=2 backslashes arrives as ceil(N/2) - in single quotes, in <<'EOF' bodies,
+in -c strings, everywhere; lone backslashes survive. Re-proven unchanged on Git for
+Windows 2.55.0.4 (bash 5.3.15, msys 3.6.9) - the defect is the harness spawn encoding,
+not Git's.
+
+A second axis existed on old Git for Windows runtimes only: any codepoint above U+007F
+made the wrapper's re-quoting fail (exit 127, `pwd -P >|...-cwd` dump, before bash ran
+anything). Measured broken on Git 2.17.1 (msys 2.10.0), byte-exact on 2.55.0.4 - the fix
+is upgrading Git, so there is no pre rule for it; the post fingerprints below still name
+it for boxes that have not upgraded.
 Backticks, $(...), ${...} and quoted heredocs behave exactly as bash defines them.
 
 The heart is one forward lexer (_lex) that carries what bash carries - quote state,
@@ -289,16 +295,6 @@ def heredocs(command):
 
 # --- PreToolUse rules --------------------------------------------------------------------
 
-def rule_non_ascii(command):
-    bad = sorted({c for c in command if ord(c) > 127})
-    if bad:
-        shown = " ".join("U+%04X %s" % (ord(c), c) for c in bad[:4])
-        return ("the command text contains non-ASCII characters (%s) - the harness wrapper fails "
-                "to re-quote them and the whole command dies with exit 127 before bash runs it; "
-                "use ASCII in the command, or %s" % (shown, FIX_FILE))
-    return None
-
-
 def rule_backslash_pair(command):
     """In a literal context any pair is a visible byte change; in a processed context bash
     itself collapses pairs, so exactly 2 cancels out unless the next char is
@@ -365,7 +361,7 @@ def rule_unquoted_heredoc_expansion(command):
     return None
 
 
-PRE_RULES = [rule_non_ascii, rule_backslash_pair, rule_unquoted_heredoc_expansion]
+PRE_RULES = [rule_backslash_pair, rule_unquoted_heredoc_expansion]
 
 
 def pre_check(command):
@@ -383,7 +379,7 @@ _WRAPPER_ANCHOR = re.compile(r"export TEMP=|eval '")
 
 POST_SIGNATURES = [
     (re.compile(r"pwd -P >\|[^\n]*-cwd: No such file or directory"),
-     "the harness wrapper tail errored - the command text failed to parse as a whole (non-ASCII in the command is the usual cause)"),
+     "the harness wrapper tail errored - the command text failed to parse as a whole (non-ASCII in the command on an old Git for Windows runtime is the usual cause; upgrading Git for Windows fixes that class)"),
     (re.compile(r"/usr/bin/bash: eval: line \d+: syntax error"),
      "the harness eval could not parse the command"),
     (re.compile(r"command substitution: line \d+: syntax error"),

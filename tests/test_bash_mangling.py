@@ -21,7 +21,8 @@ import bash_mangling_rules as rules  # noqa: E402
 import bash_pre  # noqa: E402
 import bash_post  # noqa: E402
 
-# --- corpus: commands the harness ate (axis 1: backslash runs; axis 2: non-ASCII) --------
+# --- corpus: commands the harness ate (axis 1: backslash runs; ex-axis 2 non-ASCII moved
+# --- to OK when the Git 2.55 runtime fixed it) -------------------------------------------
 
 EATEN = {
     "axis1: python heredoc, \\\\n and \\\" in the body -> real newline, stripped quote":
@@ -42,14 +43,6 @@ EATEN = {
         'python -c "print(\'P31-OK \\\\\\\\ two\')"',
     "axis1: three backslashes in double quotes":
         'printf "%s" "x\\\\\\"y" > "$D/t.txt"',
-    "axis2: em dash in a single-quoted printf":
-        "printf '%s' 'Verified rather than assumed \u2014 the whole smoke' > \"$D/r1.md\"",
-    "axis2: em dash alone":
-        "printf '%s' '\u2014' > \"$D/d.txt\"",
-    "axis2: non-ASCII inside a quoted heredoc":
-        "cat > \"$D/q.txt\" <<'EOF'\n\u201cquoted\u201d text\nEOF\n",
-    "axis2: non-ASCII in a python heredoc string (PR body edit)":
-        "python - \"$S\" <<'EOF'\ns = s.replace(\"Two changes\", \"Three changes \u2014 see above\")\nEOF\n",
     "axis1: backslash pair in a double-quoted-delimiter heredoc (<<\"EOF\")":
         "cat > \"$D/dq.txt\" <<\"EOF\"\nx\\\\y\nEOF\n",
     "axis1: backslash pair in a dash heredoc (<<-'EOF')":
@@ -119,6 +112,16 @@ EATEN = {
 # --- corpus: shapes that came through byte-exact and must stay allowed -------------------
 
 OK = {
+    # the four ex-axis2 entries: EATEN on Git for Windows 2.17.1 (msys 2.10.0, exit 127
+    # before bash ran), byte-exact on 2.55.0.4 (msys 3.6.9) - re-probed 2026-08-19
+    "ex-axis2: em dash in a single-quoted printf":
+        "printf '%s' 'Verified rather than assumed — the whole smoke' > \"$D/r1.md\"",
+    "ex-axis2: em dash alone":
+        "printf '%s' '—' > \"$D/d.txt\"",
+    "ex-axis2: non-ASCII inside a quoted heredoc":
+        "cat > \"$D/q.txt\" <<'EOF'\n“quoted” text\nEOF\n",
+    "ex-axis2: non-ASCII in a python heredoc string (PR body edit)":
+        "python - \"$S\" <<'EOF'\ns = s.replace(\"Two changes\", \"Three changes — see above\")\nEOF\n",
     "backtick inside single quotes":
         "printf '%s' 'a `word` b' > \"$D/a.txt\"",
     "backtick inside a quoted heredoc body":
@@ -235,11 +238,6 @@ class PreRules(unittest.TestCase):
         for name, cmd in EATEN.items():
             with self.subTest(name):
                 self.assertIn("Write tool", rules.pre_check(cmd))
-
-    def test_non_ascii_rule_names_the_codepoint(self):
-        msg = rules.rule_non_ascii("echo '\u2014'")
-        self.assertIn("U+2014", msg)
-        self.assertIsNone(rules.rule_non_ascii("echo plain ascii ~ {} [] | & ;"))
 
     def test_backslash_runs_scanner_tracks_context(self):
         runs = list(rules.backslash_runs("echo 'a\\\\b' \"c\\\\\\\\d\" e\\\\\\f"))
@@ -479,20 +477,20 @@ class PostSignatures(unittest.TestCase):
 
 class PreHook(unittest.TestCase):
     def test_decide_denies_with_the_documented_shape(self):
-        out = bash_pre.decide({"tool_name": "Bash", "tool_input": {"command": "echo '\u2014'"}})
+        out = bash_pre.decide({"tool_name": "Bash", "tool_input": {"command": "printf '%s' 'x\\\\y'"}})
         self.assertEqual("deny", out["hookSpecificOutput"]["permissionDecision"])
         self.assertEqual("PreToolUse", out["hookSpecificOutput"]["hookEventName"])
         self.assertTrue(out["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_decide_allows_clean_and_ignores_other_tools(self):
         self.assertIsNone(bash_pre.decide({"tool_name": "Bash", "tool_input": {"command": "git status"}}))
-        self.assertIsNone(bash_pre.decide({"tool_name": "Read", "tool_input": {"command": "echo '\u2014'"}}),
+        self.assertIsNone(bash_pre.decide({"tool_name": "Read", "tool_input": {"command": "printf '%s' 'x\\\\y'"}}),
                           "a non-Bash tool is ignored even when its input would be denied as a command")
         self.assertIsNone(bash_pre.decide({"tool_name": "Bash", "tool_input": {}}))
         self.assertIsNone(bash_pre.decide({}))
 
     def test_process_contract(self):
-        deny = run_hook("bash_pre.py", {"tool_name": "Bash", "tool_input": {"command": "echo '\u2014'"}})
+        deny = run_hook("bash_pre.py", {"tool_name": "Bash", "tool_input": {"command": "printf '%s' 'x\\\\y'"}})
         self.assertEqual(0, deny.returncode)
         self.assertEqual("deny", json.loads(deny.stdout)["hookSpecificOutput"]["permissionDecision"])
         allow = run_hook("bash_pre.py", {"tool_name": "Bash", "tool_input": {"command": "git status"}})

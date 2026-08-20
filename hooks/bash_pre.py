@@ -14,6 +14,8 @@ def decide(event):
     """The hook's pure half: event dict -> output dict or None (allow)."""
     if event.get("tool_name") != "Bash":
         return None
+    if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "PROBE_MODE")):
+        return None  # probe mode: let mangling-shaped commands through so they can be measured
     from bash_mangling_rules import pre_check
     command = (event.get("tool_input") or {}).get("command") or ""
     reason = pre_check(command)
