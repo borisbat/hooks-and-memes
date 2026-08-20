@@ -60,20 +60,21 @@ blocks a command.
   "hooks": {
     "PreToolUse": [
       { "matcher": "Bash", "hooks": [
-        { "type": "command", "command": "python", "args": ["D:/Work/hooks-and-memes/hooks/bash_pre.py"], "timeout": 10 } ] }
+        { "type": "command", "command": "python", "args": ["C:/path/to/hooks-and-memes/hooks/bash_pre.py"], "timeout": 10 } ] }
     ],
     "PostToolUse": [
       { "matcher": "Bash", "hooks": [
-        { "type": "command", "command": "python", "args": ["D:/Work/hooks-and-memes/hooks/bash_post.py"], "timeout": 10 } ] }
+        { "type": "command", "command": "python", "args": ["C:/path/to/hooks-and-memes/hooks/bash_post.py"], "timeout": 10 } ] }
     ],
     "PostToolUseFailure": [
       { "matcher": "Bash", "hooks": [
-        { "type": "command", "command": "python", "args": ["D:/Work/hooks-and-memes/hooks/bash_post.py"], "timeout": 10 } ] }
+        { "type": "command", "command": "python", "args": ["C:/path/to/hooks-and-memes/hooks/bash_post.py"], "timeout": 10 } ] }
     ]
   }
 }
 ```
 
+Point the paths at wherever you cloned this repo — forward slashes work on Windows.
 Exec form (`args` present) needs a real executable — `python` resolves to `python.exe`
 on Windows; use `python3` where that is the real binary. Restart the session after editing.
 
